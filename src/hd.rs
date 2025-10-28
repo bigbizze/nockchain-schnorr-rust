@@ -21,8 +21,16 @@ const STANDARD_EXTENDED_PUBLIC_VERSION: u32 = 0x04B2_4746;
 const HOON_EXTENDED_PRIVATE_VERSION: u32 = 0x0110_6331;
 const HOON_EXTENDED_PUBLIC_VERSION: u32 = 0x0C0E_BB09;
 
+fn to_hoon_little_endian(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    out.reverse();
+    out
+}
+
 fn hmac_sha512(key: &[u8], message: &[u8]) -> Result<[u8; 64], SchnorrError> {
-    let mut mac = HmacSha512::new_from_slice(key)?;
+    let key_le = to_hoon_little_endian(key);
+
+    let mut mac = HmacSha512::new_from_slice(&key_le)?;
     mac.update(message);
     let result = mac.finalize().into_bytes();
     Ok(result.into())
@@ -31,8 +39,8 @@ fn hmac_sha512(key: &[u8], message: &[u8]) -> Result<[u8; 64], SchnorrError> {
 fn split_digest(digest: &[u8; 64]) -> ([u8; 32], [u8; 32]) {
     let mut left = [0u8; 32];
     let mut right = [0u8; 32];
-    left.copy_from_slice(&digest[32..]);
-    right.copy_from_slice(&digest[..32]);
+    left.copy_from_slice(&digest[..32]);
+    right.copy_from_slice(&digest[32..]);
     (left, right)
 }
 
@@ -341,13 +349,13 @@ impl ExtendedPrivateKey {
         let index_bytes = ser32(child.value());
         let parent_pub_bytes = self.public_key.to_bytes();
         let mut data = Vec::with_capacity(if child.is_hardened() { 37 } else { 101 });
+        data.extend_from_slice(&index_bytes);
         if child.is_hardened() {
-            data.push(0);
             data.extend_from_slice(&self.secret_key.to_be_bytes());
+            data.push(0);
         } else {
             data.extend_from_slice(&parent_pub_bytes);
         }
-        data.extend_from_slice(&index_bytes);
 
         let mut digest = hmac_sha512(&self.chain_code, &data)?;
         loop {
@@ -455,8 +463,8 @@ impl ExtendedPublicKey {
         }
         let index_bytes = ser32(child.value());
         let mut data = Vec::with_capacity(101);
-        data.extend_from_slice(&self.public_key.to_bytes());
         data.extend_from_slice(&index_bytes);
+        data.extend_from_slice(&self.public_key.to_bytes());
         let mut digest = hmac_sha512(&self.chain_code, &data)?;
 
         loop {
@@ -827,5 +835,17 @@ mod tests {
             reparsed.secret_key().to_be_bytes()
         );
         assert_eq!(child.chain_code(), reparsed.chain_code());
+    }
+
+    #[test]
+    fn master_public_matches_cli_vector() {
+        let master = ExtendedPrivateKey::from_mnemonic(TEST_MNEMONIC, "", 0).unwrap();
+        let public_bytes = master.public_key().to_bytes();
+        let expected_hex = "0199504a8a7bc93f083d244623c458410dd300c9ea8c2c822841d5a706285c06ec25595d68b0912d0c80488556f45b95390fa1239e1327643b138caf5c879d9e44cbab87a8dde3147e7102985af71fae78d1141f457adfe23d2c523e5b70c88604";
+        assert_eq!(hex::encode(public_bytes), expected_hex);
+
+        let expected_address = "3Rzu9ga8nUCm3LSiSs6oh4uNYFos8cL6TmwQP8dXMheJTsvwCZjvDKndhU8dKvBvrrU88exM7fTo5WpEG75EwUrSPxgXLC8VhGESektqKUbFFPjTX8b4DJvZ6t9U3L4PGXeK";
+        let address = bs58::encode(public_bytes).into_string();
+        assert_eq!(address, expected_address);
     }
 }

@@ -1,7 +1,7 @@
 mod error;
 mod hd;
 mod types;
-mod util;
+pub mod util;
 
 pub use error::SchnorrError;
 pub use hd::{

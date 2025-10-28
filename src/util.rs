@@ -98,6 +98,7 @@ pub fn serialize_point(point: &CheetahPoint) -> [u8; 97] {
     let mut bytes = [0u8; 97];
     bytes[0] = 1;
     let mut offset = 1;
+    // Match the Hoon `ser-a-pt` ordering (y limbs first, then x limbs, little-end per limb).
     for belt in point.y.0.iter().rev().chain(point.x.0.iter().rev()) {
         bytes[offset..offset + 8].copy_from_slice(&belt.0.to_be_bytes());
         offset += 8;
@@ -109,17 +110,19 @@ pub fn deserialize_point(bytes: &[u8; 97]) -> Result<CheetahPoint, &'static str>
     if bytes[0] != 1 {
         return Err("invalid leading byte");
     }
-    let mut belts = Vec::with_capacity(12);
-    for chunk in bytes[1..].chunks_exact(8) {
+    let mut x_array = [Belt(0); 6];
+    let mut y_array = [Belt(0); 6];
+    let mut iter = bytes[1..].chunks_exact(8);
+    for belt in y_array.iter_mut().rev() {
+        let chunk = iter.next().ok_or("invalid y coordinate chunk")?;
         let arr: [u8; 8] = chunk.try_into().map_err(|_| "invalid chunk")?;
-        belts.push(Belt(u64::from_be_bytes(arr)));
+        *belt = Belt(u64::from_be_bytes(arr));
     }
-    belts.reverse();
-
-    let x_array: [Belt; 6] =
-        <[Belt; 6]>::try_from(&belts[..6]).map_err(|_| "invalid x coordinate")?;
-    let y_array: [Belt; 6] =
-        <[Belt; 6]>::try_from(&belts[6..12]).map_err(|_| "invalid y coordinate")?;
+    for belt in x_array.iter_mut().rev() {
+        let chunk = iter.next().ok_or("invalid x coordinate chunk")?;
+        let arr: [u8; 8] = chunk.try_into().map_err(|_| "invalid chunk")?;
+        *belt = Belt(u64::from_be_bytes(arr));
+    }
 
     let point = CheetahPoint {
         x: F6lt(x_array),
