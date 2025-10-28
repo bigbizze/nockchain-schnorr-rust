@@ -94,6 +94,50 @@ pub fn hash_bytes_to_digest(message: &[u8]) -> Tip5Digest {
     hash_varlen(&mut belts)
 }
 
+fn rip32_words(message: &[u8]) -> Vec<u32> {
+    if message.is_empty() {
+        return vec![0];
+    }
+
+    let mut words = Vec::with_capacity((message.len() + 3) / 4);
+    let mut chunk = [0u8; 4];
+    for (idx, byte) in message.iter().enumerate() {
+        chunk[idx % 4] = *byte;
+        if idx % 4 == 3 {
+            words.push(u32::from_le_bytes(chunk));
+            chunk = [0u8; 4];
+        }
+    }
+    let rem = message.len() % 4;
+    if rem != 0 {
+        for i in rem..4 {
+            chunk[i] = 0;
+        }
+        words.push(u32::from_le_bytes(chunk));
+    }
+    words
+}
+
+pub fn hash_page_message(message: &[u8]) -> Tip5Digest {
+    let mut words = rip32_words(message);
+    words.push(0);
+
+    let mut belts = Vec::with_capacity(1 + words.len() + (words.len().saturating_sub(1) * 2));
+    belts.push(Belt((words.len() as u64) % PRIME));
+    for word in &words {
+        belts.push(Belt((*word as u64) % PRIME));
+    }
+
+    if words.len() > 0 {
+        for _ in 0..(words.len() - 1) {
+            belts.push(Belt(0));
+            belts.push(Belt(1));
+        }
+    }
+
+    hash_varlen(&mut belts)
+}
+
 pub fn serialize_point(point: &CheetahPoint) -> [u8; 97] {
     let mut bytes = [0u8; 97];
     bytes[0] = 1;

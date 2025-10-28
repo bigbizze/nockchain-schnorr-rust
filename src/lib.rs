@@ -17,7 +17,7 @@ use nockchain_math_core::crypto::cheetah::{
 };
 use nockchain_math_core::tip5::hash::hash_varlen;
 use util::{
-    extend_with_digest, extend_with_point_xy, extend_with_words32, hash_bytes_to_digest,
+    extend_with_digest, extend_with_point_xy, extend_with_words32, hash_page_message,
     scalar_is_zero,
 };
 
@@ -26,7 +26,7 @@ pub fn derive_public_key(secret: &SecretKey) -> Result<PublicKey, SchnorrError> 
 }
 
 pub fn hash_message(message: &[u8]) -> Tip5Digest {
-    hash_bytes_to_digest(message)
+    hash_page_message(message)
 }
 
 pub fn sign_message(secret: &SecretKey, message: &[u8]) -> Result<Signature, SchnorrError> {
@@ -203,7 +203,7 @@ mod tests {
         assert!(verify_message(&pk, message, &sig));
 
         let mut tampered = message.to_vec();
-        tampered.push(0u8);
+        tampered[0] ^= 0x01;
         assert!(!verify_message(&pk, &tampered, &sig));
     }
 }

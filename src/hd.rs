@@ -28,6 +28,10 @@ fn to_hoon_little_endian(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn hmac_sha512(key: &[u8], message: &[u8]) -> Result<[u8; 64], SchnorrError> {
+    // Hoon treats byts as little‑endian atoms. To mirror ++hmac usage where
+    // the key is provided as a byts width/value pair (e.g. [32 cad]), we feed
+    // the key in little‑endian order. The message bytes we build explicitly
+    // below already match Hoon’s ordering, so we pass them as-is.
     let key_le = to_hoon_little_endian(key);
 
     let mut mac = HmacSha512::new_from_slice(&key_le)?;
@@ -57,8 +61,10 @@ fn double_sha256(data: &[u8]) -> [u8; 32] {
 fn add_checksum(payload: &[u8]) -> Vec<u8> {
     let checksum = double_sha256(payload);
     let mut out = Vec::with_capacity(payload.len() + 4);
-    out.extend_from_slice(&checksum[..4]);
+    // Match Hoon: payload first, then checksum at end
     out.extend_from_slice(payload);
+    // Use first 4 bytes of double SHA-256
+    out.extend_from_slice(&checksum[..4]);
     out
 }
 
@@ -66,9 +72,11 @@ fn verify_checksum(data: &[u8]) -> bool {
     if data.len() < 5 {
         return false;
     }
-    let payload = &data[4..];
-    let checksum = &data[..4];
+    // Checksum is at the end, payload at the beginning
+    let payload = &data[..data.len() - 4];
+    let checksum = &data[data.len() - 4..];
     let expected = double_sha256(payload);
+    // Use first 4 bytes of double SHA-256
     checksum == &expected[..4]
 }
 
@@ -77,7 +85,8 @@ fn decode_base58(s: &str) -> Result<Vec<u8>, SchnorrError> {
     if !verify_checksum(&decoded) {
         return Err(SchnorrError::ExtendedKey("checksum mismatch".into()));
     }
-    Ok(decoded[4..].to_vec())
+    // Checksum is at the end, remove last 4 bytes
+    Ok(decoded[..decoded.len() - 4].to_vec())
 }
 
 fn encode_base58(payload: &[u8]) -> String {
@@ -346,12 +355,19 @@ impl ExtendedPrivateKey {
     }
 
     pub fn derive_child(&self, child: ChildNumber) -> Result<Self, SchnorrError> {
-        let index_bytes = ser32(child.value());
+        // Hoon's (can 3 ~[4^i ...]) places the 4-byte index in the least
+        // significant position of a little-endian atom, which corresponds to
+        // little-endian byte order at the start of the input stream.
+        let index_bytes = child.value().to_le_bytes();
         let parent_pub_bytes = self.public_key.to_bytes();
         let mut data = Vec::with_capacity(if child.is_hardened() { 37 } else { 101 });
         data.extend_from_slice(&index_bytes);
         if child.is_hardened() {
-            data.extend_from_slice(&self.secret_key.to_be_bytes());
+            // Hoon uses 32^prv within (can 3 ...), i.e. 32 bytes of the
+            // private scalar in little-endian order, followed by 1^0.
+            let mut sk_le = self.secret_key.to_be_bytes();
+            sk_le.reverse();
+            data.extend_from_slice(&sk_le);
             data.push(0);
         } else {
             data.extend_from_slice(&parent_pub_bytes);
@@ -397,16 +413,35 @@ impl ExtendedPrivateKey {
     }
 
     pub fn extended_private_key(&self) -> Result<String, SchnorrError> {
+        // IMPORTANT: To match CLI/Hoon behavior, we normalize derived keys to look like master keys.
+        //
+        // Why: The Hoon wallet (types.hoon:58) exports derived keys with only [key, chain_code, version],
+        // stripping depth/parent_fp/index metadata. When these keys are passed to slip10's from-private,
+        // they get default values (depth=0, parent_fp=0, index=0). This makes derived keys "standalone"
+        // so they can be imported and used as new master keys.
+        //
+        // Trade-offs:
+        // - LOSE: BIP32 derivation path metadata (depth, parent fingerprint, child index)
+        // - LOSE: Ability to detect if a key is derived vs master from the extended key alone
+        // - GAIN: Derived keys can be imported/exported as standalone masters
+        // - GAIN: CLI compatibility - keys can be exchanged between Rust lib and Hoon wallet
+        //
+        // Implications:
+        // - You cannot reconstruct the full derivation path from an exported key
+        // - You must track derivation paths externally if needed
+        // - Each derived key becomes an independent master in its own right
+        // - This matches BIP32's intention that derived keys can be used as new masters
+
         let mut key_data = [0u8; 33];
         key_data[1..].copy_from_slice(&self.secret_key.to_be_bytes());
         let payload = serialize_extended(
             &key_data,
             &self.chain_code,
-            self.index,
-            self.parent_fingerprint,
-            self.depth,
+            0,                  // index: normalized to 0
+            [0u8; 4],           // parent_fingerprint: normalized to zeros
+            0,                  // depth: normalized to 0
             self.version,
-            STANDARD_EXTENDED_PRIVATE_VERSION,
+            HOON_EXTENDED_PRIVATE_VERSION,
         );
         Ok(encode_base58(&payload))
     }
@@ -474,6 +509,7 @@ impl ExtendedPublicKey {
                 Ok(p) => p,
                 Err(_) => {
                     let mut retry = Vec::with_capacity(37);
+                    // Retry HMAC input [4^i 32^right 1^0x1] with i in LE
                     retry.extend_from_slice(&index_bytes);
                     retry.extend_from_slice(&right_bytes);
                     retry.push(0x01);
@@ -526,15 +562,19 @@ impl ExtendedPublicKey {
     }
 
     pub fn extended_public_key(&self) -> Result<String, SchnorrError> {
+        // IMPORTANT: To match CLI/Hoon behavior, we normalize derived keys to look like master keys.
+        // See detailed explanation in ExtendedPrivateKey::extended_private_key() above.
+        // This allows derived public keys to be exported/imported as standalone masters.
+
         let key_data = self.public_key.to_bytes();
         let payload = serialize_extended(
             &key_data,
             &self.chain_code,
-            self.index,
-            self.parent_fingerprint,
-            self.depth,
+            0,                  // index: normalized to 0
+            [0u8; 4],           // parent_fingerprint: normalized to zeros
+            0,                  // depth: normalized to 0
             self.version,
-            STANDARD_EXTENDED_PUBLIC_VERSION,
+            HOON_EXTENDED_PUBLIC_VERSION,
         );
         Ok(encode_base58(&payload))
     }
@@ -570,14 +610,16 @@ fn serialize_extended(
     version: u8,
     typ: u32,
 ) -> Vec<u8> {
+    // Match Hoon order - `can` puts first element at least significant position
+    // but in byte array representation this becomes the opposite order
     let mut payload = Vec::with_capacity(key_data.len() + 46);
     payload.extend_from_slice(&typ.to_be_bytes());
+    payload.push(version);
     payload.push(depth);
     payload.extend_from_slice(&parent_fingerprint);
     payload.extend_from_slice(&ser32(index));
     payload.extend_from_slice(chain_code);
     payload.extend_from_slice(key_data);
-    payload.push(version);
     payload
 }
 
@@ -643,36 +685,9 @@ fn parse_extended_private_hoon(payload: &[u8]) -> Result<ExtendedPrivateKey, Sch
         ));
     }
     let has_version = payload.len() == key_size + 46;
-    let key_data = &payload[..key_size];
-    if key_data[0] != 0 {
-        return Err(SchnorrError::ExtendedKey(
-            "extended private key is missing leading 0x00".into(),
-        ));
-    }
-    let mut secret_bytes = [0u8; 32];
-    secret_bytes.copy_from_slice(&key_data[1..]);
-    let mut chain_code = [0u8; 32];
-    chain_code.copy_from_slice(&payload[key_size..key_size + 32]);
-    let index = u32::from_be_bytes(
-        payload[key_size + 32..key_size + 36]
-            .try_into()
-            .map_err(|_| SchnorrError::ExtendedKey("invalid child index".into()))?,
-    );
-    let mut parent_fp = [0u8; 4];
-    parent_fp.copy_from_slice(&payload[key_size + 36..key_size + 40]);
-    let depth = payload[key_size + 40];
-    let version = if has_version {
-        payload[key_size + 41]
-    } else {
-        0
-    };
-    let typ_offset = key_size + 41 + (has_version as usize);
-    if payload.len() < typ_offset + 4 {
-        return Err(SchnorrError::ExtendedKey(
-            "extended private key is truncated".into(),
-        ));
-    }
-    let typ_bytes: [u8; 4] = payload[typ_offset..typ_offset + 4]
+
+    // New order: typ, version, depth, parent_fp, index, chain_code, key_data
+    let typ_bytes: [u8; 4] = payload[..4]
         .try_into()
         .map_err(|_| SchnorrError::ExtendedKey("invalid private key type".into()))?;
     if typ_bytes != HOON_EXTENDED_PRIVATE_VERSION.to_be_bytes() {
@@ -680,6 +695,28 @@ fn parse_extended_private_hoon(payload: &[u8]) -> Result<ExtendedPrivateKey, Sch
             "unexpected extended private key type".into(),
         ));
     }
+
+    let version = if has_version { payload[4] } else { 0 };
+    let depth = payload[5];
+    let mut parent_fp = [0u8; 4];
+    parent_fp.copy_from_slice(&payload[6..10]);
+    let index = u32::from_be_bytes(
+        payload[10..14]
+            .try_into()
+            .map_err(|_| SchnorrError::ExtendedKey("invalid child index".into()))?,
+    );
+    let mut chain_code = [0u8; 32];
+    chain_code.copy_from_slice(&payload[14..46]);
+
+    let key_data = &payload[46..46 + key_size];
+    if key_data[0] != 0 {
+        return Err(SchnorrError::ExtendedKey(
+            "extended private key is missing leading 0x00".into(),
+        ));
+    }
+    let mut secret_bytes = [0u8; 32];
+    secret_bytes.copy_from_slice(&key_data[1..]);
+
     let secret = SecretKey::from_bytes_be(secret_bytes)?;
     let public = secret.public_key()?;
     Ok(ExtendedPrivateKey {
@@ -748,34 +785,9 @@ fn parse_extended_public_hoon(payload: &[u8]) -> Result<ExtendedPublicKey, Schno
         ));
     }
     let has_version = payload.len() == key_size + 46;
-    let key_data = &payload[..key_size];
-    let mut point_bytes = [0u8; 97];
-    point_bytes.copy_from_slice(key_data);
-    let point =
-        deserialize_point(&point_bytes).map_err(|err| SchnorrError::ExtendedKey(err.into()))?;
 
-    let mut chain_code = [0u8; 32];
-    chain_code.copy_from_slice(&payload[key_size..key_size + 32]);
-    let index = u32::from_be_bytes(
-        payload[key_size + 32..key_size + 36]
-            .try_into()
-            .map_err(|_| SchnorrError::ExtendedKey("invalid child index".into()))?,
-    );
-    let mut parent_fp = [0u8; 4];
-    parent_fp.copy_from_slice(&payload[key_size + 36..key_size + 40]);
-    let depth = payload[key_size + 40];
-    let version = if has_version {
-        payload[key_size + 41]
-    } else {
-        0
-    };
-    let typ_offset = key_size + 41 + (has_version as usize);
-    if payload.len() < typ_offset + 4 {
-        return Err(SchnorrError::ExtendedKey(
-            "extended public key is truncated".into(),
-        ));
-    }
-    let typ_bytes: [u8; 4] = payload[typ_offset..typ_offset + 4]
+    // New order: typ, version, depth, parent_fp, index, chain_code, key_data
+    let typ_bytes: [u8; 4] = payload[..4]
         .try_into()
         .map_err(|_| SchnorrError::ExtendedKey("invalid public key type".into()))?;
     if typ_bytes != HOON_EXTENDED_PUBLIC_VERSION.to_be_bytes() {
@@ -783,6 +795,25 @@ fn parse_extended_public_hoon(payload: &[u8]) -> Result<ExtendedPublicKey, Schno
             "unexpected extended public key type".into(),
         ));
     }
+
+    let version = if has_version { payload[4] } else { 0 };
+    let depth = payload[5];
+    let mut parent_fp = [0u8; 4];
+    parent_fp.copy_from_slice(&payload[6..10]);
+    let index = u32::from_be_bytes(
+        payload[10..14]
+            .try_into()
+            .map_err(|_| SchnorrError::ExtendedKey("invalid child index".into()))?,
+    );
+    let mut chain_code = [0u8; 32];
+    chain_code.copy_from_slice(&payload[14..46]);
+
+    let key_data = &payload[46..46 + key_size];
+    let mut point_bytes = [0u8; 97];
+    point_bytes.copy_from_slice(key_data);
+    let point =
+        deserialize_point(&point_bytes).map_err(|err| SchnorrError::ExtendedKey(err.into()))?;
+
     Ok(ExtendedPublicKey {
         public_key: PublicKey(point),
         chain_code,
