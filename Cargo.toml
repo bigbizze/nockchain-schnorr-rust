@@ -1,0 +1,27 @@
+[package]
+name = "nockchain-schnorr-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Schnorr signatures on the Cheetah curve implemented in Rust for Nockchain, targeting WASM."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nockchain/nockchain"
+
+[features]
+default = ["std"]
+std = ["nockchain-math-core/std"]
+serde = ["dep:serde", "nockchain-math-core/serde"]
+
+[dependencies]
+ibig = "0.3.6"
+thiserror = "2.0.11"
+nockchain-math-core = { path = "../nockchain-math-core", default-features = false, features = ["std"] }
+serde = { version = "1.0", features = ["derive"], optional = true, default-features = false }
+bip39 = { version = "1.2", default-features = false, features = ["std"] }
+hmac = "0.12"
+sha2 = "0.10"
+ripemd = "0.1"
+bs58 = "0.5"
+num-traits = "0.2"
+
+[dev-dependencies]
+hex = "0.4"
