@@ -4,6 +4,6 @@
 
 Also implementing PublicKeys, SecretKeyd and Signatures.
 
-Not thoroughly tested yet.
+Needs more unit tests 
 
 \(See: https://github.com/bigbizze/nockchain-tx\)
