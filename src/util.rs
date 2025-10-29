@@ -162,6 +162,7 @@ pub fn deserialize_point(bytes: &[u8; 97]) -> Result<CheetahPoint, &'static str>
         let arr: [u8; 8] = chunk.try_into().map_err(|_| "invalid chunk")?;
         *belt = Belt(u64::from_be_bytes(arr));
     }
+    
     for belt in x_array.iter_mut().rev() {
         let chunk = iter.next().ok_or("invalid x coordinate chunk")?;
         let arr: [u8; 8] = chunk.try_into().map_err(|_| "invalid chunk")?;

@@ -5,6 +5,7 @@ edition = "2021"
 description = "Schnorr signatures on the Cheetah curve implemented in Rust for Nockchain, targeting WASM."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nockchain/nockchain"
+authors = ["Charles Anderson"]
 
 [features]
 default = ["std"]
@@ -24,4 +25,3 @@ bs58 = "0.5"
 num-traits = "0.2"
 hex = "0.4"
 
-#[dev-dependencies]
