@@ -22,6 +22,6 @@ sha2 = "0.10"
 ripemd = "0.1"
 bs58 = "0.5"
 num-traits = "0.2"
-
-[dev-dependencies]
 hex = "0.4"
+
+#[dev-dependencies]

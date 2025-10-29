@@ -28,12 +28,14 @@ fn to_hoon_little_endian(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn hmac_sha512(key: &[u8], message: &[u8]) -> Result<[u8; 64], SchnorrError> {
-    // Hoon treats byts as little‑endian atoms. To mirror ++hmac usage where
-    // the key is provided as a byts width/value pair (e.g. [32 cad]), we feed
-    // the key in little‑endian order. The message bytes we build explicitly
-    // below already match Hoon’s ordering, so we pass them as-is.
-    let key_le = to_hoon_little_endian(key);
+    let mut mac = HmacSha512::new_from_slice(key)?;
+    mac.update(message);
+    let result = mac.finalize().into_bytes();
+    Ok(result.into())
+}
 
+fn hmac_sha512_with_domain_separator(message: &[u8]) -> Result<[u8; 64], SchnorrError> {
+    let key_le = to_hoon_little_endian(DOMAIN_SEPARATOR);
     let mut mac = HmacSha512::new_from_slice(&key_le)?;
     mac.update(message);
     let result = mac.finalize().into_bytes();
@@ -43,6 +45,18 @@ fn hmac_sha512(key: &[u8], message: &[u8]) -> Result<[u8; 64], SchnorrError> {
 fn split_digest(digest: &[u8; 64]) -> ([u8; 32], [u8; 32]) {
     let mut left = [0u8; 32];
     let mut right = [0u8; 32];
+    left.copy_from_slice(&digest[..32]);
+    right.copy_from_slice(&digest[32..]);
+    (left, right)
+}
+
+fn split_digest_swapped(digest: &[u8; 64]) -> ([u8; 32], [u8; 32]) {
+    let mut left = [0u8; 32];
+    let mut right = [0u8; 32];
+    // Despite the name, Hoon's cut on atoms works differently than expected:
+    // (cut 3 [32 32] digest) gets the HIGH 32 bytes = our digest[0..32] = Hoon's left
+    // (cut 3 [0 32] digest) gets the LOW 32 bytes = our digest[32..64] = Hoon's right
+    // This matches the actual output where left=0x9f34... (our bytes 0-31)
     left.copy_from_slice(&digest[..32]);
     right.copy_from_slice(&digest[32..]);
     (left, right)
@@ -293,7 +307,7 @@ impl ExtendedPrivateKey {
         }
         let mut message = seed.to_vec();
         loop {
-            let digest = hmac_sha512(DOMAIN_SEPARATOR, &message)?;
+            let digest = hmac_sha512_with_domain_separator(&message)?;
             let (left_bytes, right_bytes) = split_digest(&digest);
             let scalar = UBig::from_be_bytes(&left_bytes);
             if scalar.is_zero() || scalar >= *G_ORDER {
@@ -355,27 +369,30 @@ impl ExtendedPrivateKey {
     }
 
     pub fn derive_child(&self, child: ChildNumber) -> Result<Self, SchnorrError> {
-        // Hoon's (can 3 ~[4^i ...]) places the 4-byte index in the least
-        // significant position of a little-endian atom, which corresponds to
-        // little-endian byte order at the start of the input stream.
-        let index_bytes = child.value().to_le_bytes();
+        let index_bytes = ser32(child.value());
         let parent_pub_bytes = self.public_key.to_bytes();
         let mut data = Vec::with_capacity(if child.is_hardened() { 37 } else { 101 });
-        data.extend_from_slice(&index_bytes);
+        // Hoon's (can 3 ~[4^i 97^pubkey]) produces pubkey || index due to LE atom representation
         if child.is_hardened() {
-            // Hoon uses 32^prv within (can 3 ...), i.e. 32 bytes of the
-            // private scalar in little-endian order, followed by 1^0.
-            let mut sk_le = self.secret_key.to_be_bytes();
-            sk_le.reverse();
-            data.extend_from_slice(&sk_le);
+            data.extend_from_slice(&self.secret_key.to_be_bytes());
             data.push(0);
+            data.extend_from_slice(&index_bytes);
         } else {
             data.extend_from_slice(&parent_pub_bytes);
+            data.extend_from_slice(&index_bytes);
         }
 
         let mut digest = hmac_sha512(&self.chain_code, &data)?;
+        let mut is_first_iteration = true;
         loop {
-            let (left_bytes, right_bytes) = split_digest(&digest);
+            // First HMAC uses swapped interpretation, retries use normal
+            let (left_bytes, right_bytes) = if is_first_iteration {
+                split_digest_swapped(&digest)
+            } else {
+                split_digest(&digest)
+            };
+            is_first_iteration = false;
+
             let left_scalar = UBig::from_be_bytes(&left_bytes);
             let candidate = (&left_scalar + self.secret_key.scalar()) % &*G_ORDER;
 
@@ -396,10 +413,11 @@ impl ExtendedPrivateKey {
                 });
             }
 
+            // Hoon retry: (can 3 ~[4^i 32^right 1^0x1]) produces 0x01 || right || index when serialized
             let mut retry = Vec::with_capacity(37);
-            retry.extend_from_slice(&index_bytes);
-            retry.extend_from_slice(&right_bytes);
             retry.push(0x01);
+            retry.extend_from_slice(&right_bytes);
+            retry.extend_from_slice(&index_bytes);
             digest = hmac_sha512(&self.chain_code, &retry)?;
         }
     }
@@ -498,20 +516,21 @@ impl ExtendedPublicKey {
         }
         let index_bytes = ser32(child.value());
         let mut data = Vec::with_capacity(101);
-        data.extend_from_slice(&index_bytes);
+        // Hoon's (can 3 ~[4^i 97^pubkey]) produces pubkey || index due to LE atom representation
         data.extend_from_slice(&self.public_key.to_bytes());
+        data.extend_from_slice(&index_bytes);
         let mut digest = hmac_sha512(&self.chain_code, &data)?;
 
         loop {
-            let (left_bytes, right_bytes) = split_digest(&digest);
+            let (left_bytes, right_bytes) = split_digest_swapped(&digest);
             let left_scalar = UBig::from_be_bytes(&left_bytes);
             let scalar_point = match ch_scal_big(&left_scalar, &A_GEN) {
                 Ok(p) => p,
                 Err(_) => {
+                    // Hoon retry: (can 3 ~[4^i 32^right 1^0x1]) = right || index || 0x01
                     let mut retry = Vec::with_capacity(37);
-                    // Retry HMAC input [4^i 32^right 1^0x1] with i in LE
-                    retry.extend_from_slice(&index_bytes);
                     retry.extend_from_slice(&right_bytes);
+                    retry.extend_from_slice(&index_bytes);
                     retry.push(0x01);
                     digest = hmac_sha512(&self.chain_code, &retry)?;
                     continue;
@@ -520,9 +539,10 @@ impl ExtendedPublicKey {
             let candidate_point = match ch_add(&scalar_point, self.public_key.as_point()) {
                 Ok(p) => p,
                 Err(_) => {
+                    // Hoon retry: (can 3 ~[4^i 32^right 1^0x1]) = right || index || 0x01
                     let mut retry = Vec::with_capacity(37);
-                    retry.extend_from_slice(&index_bytes);
                     retry.extend_from_slice(&right_bytes);
+                    retry.extend_from_slice(&index_bytes);
                     retry.push(0x01);
                     digest = hmac_sha512(&self.chain_code, &retry)?;
                     continue;
@@ -542,10 +562,11 @@ impl ExtendedPublicKey {
                 });
             }
 
+            // Hoon retry: (can 3 ~[4^i 32^right 1^0x1]) produces 0x01 || right || index when serialized
             let mut retry = Vec::with_capacity(37);
-            retry.extend_from_slice(&index_bytes);
-            retry.extend_from_slice(&right_bytes);
             retry.push(0x01);
+            retry.extend_from_slice(&right_bytes);
+            retry.extend_from_slice(&index_bytes);
             digest = hmac_sha512(&self.chain_code, &retry)?;
         }
     }
